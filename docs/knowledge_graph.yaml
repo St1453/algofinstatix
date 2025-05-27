@@ -1,0 +1,258 @@
+# Data Flow Documentation
+# Last Updated: 2025-05-28T04:05:00+09:00
+# This file documents the data flow between components in the application
+
+# Core Architecture Layers
+architecture_layers:
+  - name: Presentation
+    description: Handles HTTP requests and responses
+    responsibilities:
+      - Request validation
+      - Response formatting
+      - Authentication/Authorization
+    data_flows_to: [Application]
+
+  - name: Application
+    description: Orchestrates domain objects and implements use cases
+    responsibilities:
+      - Use case implementation
+      - Transaction management
+      - Security enforcement
+    data_flows_to: [Domain, Infrastructure]
+
+  - name: Domain
+    description: Core business logic and rules
+    responsibilities:
+      - Business rules
+      - Domain models
+      - Domain services
+    data_flows_to: []
+
+  - name: Infrastructure
+    description: Handles technical concerns and external integrations
+    responsibilities:
+      - Database operations
+      - External service integration
+      - Caching
+    data_flows_to: [Domain]
+
+# Core Modules
+modules:
+  - name: Users
+    description: Handles user management and authentication
+    components:
+      - User management
+      - Authentication
+      - Authorization
+    data_flows:
+      - from: Presentation
+        to: Application
+        via: HTTP Requests
+        data: [UserDTO, AuthDTO]
+      - from: Application
+        to: Domain
+        via: Use Cases
+        data: [User, Role, Token]
+      - from: Application
+        to: Infrastructure
+        via: Repositories
+        data: [User, Role, Token, PasswordHistory, LoginAttempt]
+
+  - name: Shared
+    description: Contains shared functionality across the application
+    components:
+      - Base repositories
+      - Common utilities
+      - Cross-cutting concerns
+    data_flows: []
+
+# Core Entities and Their Data Flow
+entities:
+  - name: User
+    description: Represents an application user
+    attributes: [email, hashed_password, is_enabled, is_verified, created_at, updated_at]
+    data_flows:
+      - from: Presentation
+        to: Application
+        via: UserDTO
+      - from: Application
+        to: Domain
+        via: User entity
+      - from: Application
+        to: Infrastructure
+        via: UserRepository
+
+  - name: Token
+    description: Manages JWT tokens
+    attributes: [token, expires_at, token_type, user_id]
+    data_flows:
+      - from: Application
+        to: Infrastructure
+        via: TokenRepository
+      - from: Infrastructure
+        to: Application
+        via: Token entity
+
+  - name: PasswordHistory
+    description: Tracks password history for security
+    attributes: [hashed_password, changed_at, user_id]
+    data_flows:
+      - from: Application
+        to: Infrastructure
+        via: PasswordHistoryRepository
+
+  - name: LoginAttempt
+    description: Tracks login attempts for security
+    attributes: [ip_address, success, timestamp, user_agent, user_id]
+    data_flows:
+      - from: Application
+        to: Infrastructure
+        via: LoginAttemptRepository
+
+# Cross-Cutting Concerns
+cross_cutting_concerns:
+  - name: Authentication
+    description: Handles user authentication
+    components: [JWT, OAuth2]
+    data_flows_across: [Presentation, Application, Infrastructure]
+
+  - name: Authorization
+    description: Handles access control
+    components: [Role-based access control, Permission system]
+    data_flows_across: [Presentation, Application, Domain]
+
+  - name: Validation
+    description: Data validation
+    components: [Pydantic models, Custom validators]
+    data_flows_across: [Presentation, Application, Domain]
+
+  - name: Error Handling
+    description: Consistent error responses
+    components: [Custom exceptions, Error handlers]
+    data_flows_across: [All layers]
+
+# External Integrations
+external_integrations:
+  - name: Database
+    type: PostgreSQL
+    data_flows:
+      - from: Infrastructure
+        to: Database
+        data: [All entities]
+        operations: [CRUD, Transactions]
+
+  - name: Email Service
+    type: SMTP/Third-party
+    data_flows:
+      - from: Application
+        to: Email Service
+        data: [User email, Templates, Content]
+        operations: [Send, Template rendering]
+
+  - name: Logging Service
+    type: Structured Logging
+    data_flows:
+      - from: All layers
+        to: Logging Service
+        data: [Application logs, Audit trails, Performance metrics]
+        operations: [Log collection, Analysis, Monitoring]
+
+# Data Flow Patterns
+patterns:
+  - name: Repository
+    description: Abstracts data access
+    used_in: [Users module, Shared module]
+    data_flows: [Domain <-> Infrastructure]
+
+  - name: Unit of Work
+    description: Manages database transactions
+    used_in: [All modules]
+    data_flows: [Application -> Infrastructure]
+
+  - name: DTO (Data Transfer Object)
+    description: Transfers data between layers
+    used_in: [Presentation <-> Application]
+    data_flows: [All cross-layer communications]
+
+# Security Considerations
+security:
+  - aspect: Data in Transit
+    implementation: HTTPS/TLS 1.3
+    data_flows: [All external communications]
+    standards: [OWASP TLS Guidelines]
+  
+  - aspect: Data at Rest
+    implementation: AES-256 encryption
+    data_flows: [Sensitive data storage, Database fields]
+    standards: [NIST SP 800-111]
+  
+  - aspect: Authentication
+    implementation: JWT with refresh tokens
+    data_flows: [All authenticated requests]
+    features: [Token rotation, Short-lived access tokens]
+  
+  - aspect: Authorization
+    implementation: Role-based access control (RBAC)
+    data_flows: [All protected resources]
+    features: [Fine-grained permissions, Permission inheritance]
+  
+  - aspect: Input Validation
+    implementation: Pydantic models, Custom validators
+    data_flows: [All incoming requests]
+    features: [Type checking, Sanitization, Whitelist validation]
+
+# Monitoring & Observability
+monitoring:
+  - type: Application Logging
+    implementation: Structured JSON logging
+    features:
+      - Correlation IDs for request tracing
+      - Log levels (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+      - Contextual logging
+    data_flows: [All application layers]
+  
+  - type: Performance Metrics
+    implementation: Custom metrics collection
+    metrics:
+      - Request latency
+      - Database query performance
+      - Error rates
+      - System resource usage
+    data_flows: [Application, Infrastructure]
+  
+  - type: Audit Logging
+    implementation: Dedicated audit logger
+    events:
+      - User authentication attempts
+      - Sensitive operations
+      - Permission changes
+    data_flows: [Security-sensitive operations]
+
+# Error Handling
+error_handling:
+  - type: Application Errors
+    implementation: Custom exception hierarchy
+    features:
+      - Standardized error responses
+      - Error codes
+      - User-friendly messages
+      - Detailed debug information (in development)
+    data_flows: [All application layers]
+  
+  - type: Database Errors
+    implementation: SQLAlchemy exception handling
+    features:
+      - Connection error handling
+      - Transaction management
+      - Deadlock detection
+    data_flows: [Database operations]
+
+# Caching Strategy
+caching:
+  status: "Planned"
+  implementation: "To be determined"
+  potential_use_cases:
+    - Frequently accessed user data
+    - Configuration settings
+    - Rate limiting data
+    - Session storage
