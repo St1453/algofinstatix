@@ -8,10 +8,7 @@ from __future__ import annotations
 
 
 class UserError(Exception):
-    """Base exception for all user-related errors.
-
-    This serves as the base class for all exceptions that are related to user operations.
-    """
+    """Base exception for all user-related errors."""
 
     pass
 
@@ -23,6 +20,12 @@ class UserNotFoundError(UserError):
 
 
 class UserAlreadyExistsError(UserError):
+    """Raised when trying to create a user that already exists."""
+
+    pass
+
+
+class UsernameAlreadyExistsError(UserError):
     """Raised when trying to create a user that already exists."""
 
     pass
@@ -64,20 +67,14 @@ class AccountError(UserError):
     pass
 
 
-class AccountLockedError(AccountError):
-    """Raised when an account is locked due to too many failed attempts."""
-
-    pass
-
-
 class AccountNotVerifiedError(AccountError):
     """Raised when an account email is not verified."""
 
     pass
 
 
-class AccountSuspendedError(AccountError):
-    """Raised when an account has been suspended by an administrator."""
+class AccountDisabledError(AccountError):
+    """Raised when an account has been disabled by an administrator."""
 
     pass
 
@@ -208,24 +205,6 @@ class RateLimitExceededError(SecurityError):
     pass
 
 
-class MFANotEnabledError(SecurityError):
-    """Raised when MFA is required but not enabled for the user."""
-
-    pass
-
-
-class MFAVerificationError(SecurityError):
-    """Raised when MFA verification fails."""
-
-    pass
-
-
-class MFASetupError(SecurityError):
-    """Raised when MFA setup fails."""
-
-    pass
-
-
 class PermissionDeniedError(SecurityError):
     """Raised when a user doesn't have permission to perform an action."""
 
@@ -268,7 +247,7 @@ class InvalidEmailError(EmailError):
     pass
 
 
-class EmailAlreadyInUseError(EmailError):
+class EmailAlreadyExistsError(EmailError):
     """Raised when an email address is already in use."""
 
     pass
@@ -276,29 +255,5 @@ class EmailAlreadyInUseError(EmailError):
 
 class EmailVerificationError(EmailError):
     """Raised when email verification fails."""
-
-    pass
-
-
-class RepositoryError(Exception):
-    """Base exception for repository-related errors."""
-
-    pass
-
-
-class DatabaseError(RepositoryError):
-    """Raised when a database operation fails."""
-
-    pass
-
-
-class ConcurrentModificationError(RepositoryError):
-    """Raised when a concurrent modification is detected."""
-
-    pass
-
-
-class OptimisticLockError(RepositoryError):
-    """Raised when an optimistic lock fails."""
 
     pass

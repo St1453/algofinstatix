@@ -9,7 +9,6 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Index,
-    Integer,
     String,
     Text,
     func,
@@ -18,14 +17,12 @@ from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.shared.infrastructure.database.base import Base
-from src.users.domain.entities.user import User as UserEntity
-from src.users.domain.value_objects.user_role_factory import UserRoleFactory
+from src.users.domain.entities.user import User
+from src.users.domain.value_objects import Email, HashedPassword
+from src.users.domain.value_objects.user_role_factory import RoleType, UserRoleFactory
 from src.users.domain.value_objects.user_status import UserStatus
 
 if TYPE_CHECKING:
-    from src.users.domain.entities.user import User
-
-    from .password_history_orm import PasswordHistoryORM
     from .token_orm import TokenORM
 
 
@@ -42,19 +39,13 @@ class UserORM(Base):
         # Indexes for common query patterns
         Index("ix_user_email", "email", unique=True),
         Index("ix_user_username", "username", unique=True),
-        Index("ix_user_status", "is_enabled_account", "is_verified_email"),
+        Index("is_enabled_account", "is_verified_email"),
         # Check constraints
         CheckConstraint("email IS NOT NULL AND email != ''", name="email_required"),
         CheckConstraint(
             "username IS NOT NULL AND username != ''", name="username_required"
         ),
         CheckConstraint("hashed_password IS NOT NULL", name="password_required"),
-        CheckConstraint(
-            "first_name IS NULL OR length(first_name) > 0", name="valid_first_name"
-        ),
-        CheckConstraint(
-            "last_name IS NULL OR length(last_name) > 0", name="valid_last_name"
-        ),
     )
 
     # Core Identity
@@ -82,6 +73,14 @@ class UserORM(Base):
         String(100), nullable=False, doc="User's last name"
     )
 
+    # Profile
+    bio: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, doc="User's biography/description"
+    )
+    profile_picture: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True, doc="URL to the user's profile picture"
+    )
+
     # Authentication & Security
     hashed_password: Mapped[str] = mapped_column(
         String(255), nullable=False, doc="Salted and hashed password"
@@ -94,27 +93,6 @@ class UserORM(Base):
         default=False,
         nullable=False,
         doc="Whether the email has been verified",
-    )
-
-    # Profile
-    bio: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True, doc="User's biography/description"
-    )
-    profile_picture: Mapped[Optional[str]] = mapped_column(
-        String(500), nullable=True, doc="URL to the user's profile picture"
-    )
-
-    # Status Tracking
-    failed_login_attempts: Mapped[int] = mapped_column(
-        Integer,  # noqa: F821
-        default=0,
-        nullable=False,
-        doc="Number of consecutive failed login attempts",
-    )
-    locked_until: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-        doc="When the account will be automatically unlocked",
     )
 
     # Timestamps
@@ -136,45 +114,18 @@ class UserORM(Base):
         nullable=True,
         doc="When the user account was soft-deleted (if applicable)",
     )
-    last_login_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True, doc="When the user last logged in"
-    )
-
-    # MFA Settings
-    mfa_enabled: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
-        nullable=False,
-        doc="Whether multi-factor authentication is enabled",
-    )
-    mfa_secret: Mapped[Optional[str]] = mapped_column(
-        String(64), nullable=True, doc="Encrypted MFA secret key"
-    )
-
     # Roles and Permissions
     roles: Mapped[Set[str]] = mapped_column(
         ARRAY(String),
         nullable=False,
-        default=lambda: {UserRoleFactory.user().name},
-        server_default=f"{{{UserRoleFactory.user().name}}}",
+        default=lambda: {"user"},  # Default role is 'user'
+        server_default="{user}",
         doc="User's roles that determine permissions",
     )
 
-    # Relationships
-    password_history: Mapped[List["PasswordHistoryORM"]] = relationship(
-        "PasswordHistoryORM",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-        order_by="desc(PasswordHistoryORM.changed_at)",
-        doc="History of user's previous passwords",
-    )
+    # Relationship to tokens (one-to-many)
     tokens: Mapped[List["TokenORM"]] = relationship(
-        "TokenORM",
-        back_populates="user",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-        passive_deletes=True,
+        "TokenORM", back_populates="user", lazy="dynamic", cascade="all, delete-orphan"
     )
 
     @classmethod
@@ -198,18 +149,9 @@ class UserORM(Base):
             profile_picture=user.profile_picture,
             is_enabled_account=user.status.is_enabled,
             is_verified_email=user.status.is_verified,
-            failed_login_attempts=user.status.failed_login_attempts,
-            locked_until=user.status.locked_until,
-            password_changed_at=user.status.password_changed_at,
             created_at=user.created_at,
             updated_at=user.updated_at,
             deleted_at=user.deleted_at,
-            last_login_at=user.status.last_login_at,
-            last_failed_login=user.status.last_failed_login,
-            mfa_enabled=user.mfa_enabled,
-            mfa_secret=user.mfa_secret,
-            password_reset_token=user.password_reset_token,
-            password_reset_token_expires=user.password_reset_token_expires,
             roles={role.name for role in user.roles},
         )
 
@@ -219,20 +161,40 @@ class UserORM(Base):
         Returns:
             User: A domain model instance with data from the ORM
         """
+
+        # Create value objects
+        email = Email(self.email) if not isinstance(self.email, Email) else self.email
+        hashed_password = (
+            HashedPassword(self.hashed_password)
+            if not isinstance(self.hashed_password, HashedPassword)
+            else self.hashed_password
+        )
+
+        # Create roles based on role names
+        roles = set()
+        for role_name in self.roles or set():
+            try:
+                role_type = RoleType(role_name.lower())
+                if role_type == RoleType.ADMIN:
+                    roles.add(UserRoleFactory().admin())
+                elif role_type == RoleType.MODERATOR:
+                    roles.add(UserRoleFactory().moderator())
+                else:
+                    roles.add(UserRoleFactory().user())
+            except ValueError:
+                # If role name is not in RoleType, default to user role
+                roles.add(UserRoleFactory().user())
+
+        # Create UserStatus value object
         status = UserStatus(
             is_enabled=self.is_enabled_account,
             is_verified=self.is_verified_email,
-            last_login_at=self.last_login_at,
-            failed_login_attempts=self.failed_login_attempts,
-            locked_until=self.locked_until,
-            password_changed_at=self.password_changed_at,
-            last_failed_login=self.last_failed_login,
         )
 
-        return UserEntity(
+        return User(
             id=self.id,
-            email=self.email,
-            hashed_password=self.hashed_password,
+            email=email,
+            hashed_password=hashed_password,
             username=self.username,
             first_name=self.first_name,
             last_name=self.last_name,
@@ -242,12 +204,5 @@ class UserORM(Base):
             created_at=self.created_at,
             updated_at=self.updated_at,
             deleted_at=self.deleted_at,
-            mfa_enabled=self.mfa_enabled,
-            mfa_secret=self.mfa_secret,
-            password_reset_token=self.password_reset_token,
-            password_reset_token_expires=self.password_reset_token_expires,
-            roles=frozenset(
-                UserRoleFactory.get_role(role_name)
-                for role_name in (self.roles or set())
-            ),
+            roles=frozenset(roles),
         )

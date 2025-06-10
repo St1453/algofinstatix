@@ -7,23 +7,34 @@ from email_validator import EmailNotValidError, validate_email
 
 @dataclass(frozen=True)
 class Email:
-    """Email value object for user email addresses with validation."""
+    """Email value object for user email addresses with validation.
+    
+    Email addresses are case-insensitive and are always stored in lowercase.
+    """
 
     value: str
 
     def __post_init__(self) -> None:
-        """Validate the email address during initialization."""
+        """Validate and normalize the email address during initialization."""
+        if not self.value:
+            raise ValueError("Email cannot be empty")
+            
         try:
-            # Use Pydantic's EmailStr for validation
-            email = validate_email(self.value.strip().lower())
-            # Use object.__setattr__ since the dataclass is frozen
-            object.__setattr__(self, "value", email)
+            # Validate and normalize the email (including case normalization)
+            validated = validate_email(self.value.strip(), check_deliverability=False)
+            # Store the normalized email in lowercase
+            object.__setattr__(self, "value", validated.email.lower())
         except EmailNotValidError as e:
             raise ValueError("Invalid email format") from e
 
+    @classmethod
+    def from_string(cls, value: str) -> "Email":
+        """Create an Email instance from a string."""
+        return cls(value)
+
     @property
     def domain(self) -> str:
-        """Get the domain part of the email."""
+        """Get the domain part of the email (after @)."""
         return self.value.split("@")[1]
 
     @property
@@ -35,9 +46,11 @@ class Email:
         return self.value
 
     def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.value.lower() == other.lower()
         if not isinstance(other, Email):
             return False
-        return self.value == other.value
+        return self.value.lower() == other.value.lower()
 
     def __hash__(self) -> int:
-        return hash(self.value)
+        return hash(self.value.lower())

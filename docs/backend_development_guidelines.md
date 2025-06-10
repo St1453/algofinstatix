@@ -98,6 +98,7 @@ The communication between layers follows these principles:
 - Use `PascalCase` for class names
 - Use `UPPER_CASE` for constants
 - Avoid global variables
+- Use `datetime.now(timezone.utc)` when need to deal with current time
 
 ### Code Organization
 - Use absolute imports
@@ -110,7 +111,6 @@ The communication between layers follows these principles:
 - Keep related functions together
 
 ### Best Practices
-- Follow SOLID principles
 - Prefer composition over inheritance
 - Use dataclasses for data containers
 - Use pathlib for filesystem operations

@@ -4,17 +4,13 @@ This module contains value objects that represent various aspects of tokens
 in the authentication and authorization system.
 """
 
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum as PyEnum
-from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from typing import Any, Dict, List, Optional, Set
 
 
-class TokenType(str, PyEnum):
+class TokenType(str):
     """Types of tokens supported by the system."""
 
     ACCESS = "access"
@@ -24,7 +20,7 @@ class TokenType(str, PyEnum):
     API = "api"
 
 
-class TokenStatus(str, PyEnum):
+class TokenStatus(str):
     """Status of a token."""
 
     ACTIVE = "active"
@@ -46,55 +42,61 @@ class TokenPayload:
 
 @dataclass(frozen=True)
 class TokenString:
-    """Value object representing a token string.
+    """Value object for token string validation.
 
-    This encapsulates the token value and provides validation and generation.
+    Supports JWT tokens and UUID strings.
     """
 
-    _value: str = field(init=False, repr=False)
-
-    # Token format: UUID4 by default
-    TOKEN_PATTERN = (
+    value: str
+    JWT_PATTERN = r"^[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*$"
+    UUID_PATTERN = (
         r"^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$"
     )
+    OPAQUE_PATTERN = r"^[A-Za-z0-9-_]+$"
 
-    def __init__(self, value: Optional[str] = None):
-        """Initialize with an existing token or generate a new one.
+    def __post_init__(self):
+        if not self.value:
+            raise ValueError("Token value cannot be empty")
 
-        Args:
-            value: Optional token string. If None, generates a new UUID4 token.
+        if not (self._is_jwt() or self._is_uuid() or self._is_opaque()):
+            raise ValueError("Invalid token format. Must be JWT, UUID, or opaque token")
 
-        Raises:
-            ValueError: If the provided token is invalid.
-        """
-        if value is None:
-            value = str(uuid4())
+    def _is_jwt(self) -> bool:
+        """Check if the token is a valid JWT."""
+        parts = self.value.split(".")
+        if len(parts) != 3:
+            return False
 
-        if not self._is_valid_token(value):
-            raise ValueError("Invalid token format")
+        # Check each part is valid base64url
+        import base64
+        import binascii
 
-        object.__setattr__(self, "_value", value)
+        for part in parts:
+            try:
+                # Add padding if needed
+                part += "=" * (4 - len(part) % 4) % 4
+                base64.urlsafe_b64decode(part)
+            except (binascii.Error, TypeError):
+                return False
 
-    @classmethod
-    def generate(cls) -> TokenString:
-        """Generate a new token."""
-        return cls()
+        return True
 
-    @classmethod
-    def _is_valid_token(cls, token: str) -> bool:
-        """Validate the token format."""
-        return bool(re.match(cls.TOKEN_PATTERN, token, re.IGNORECASE))
+    def _is_uuid(self) -> bool:
+        """Check if the token is a valid UUID."""
+        try:
+            from uuid import UUID as UUIDValidator
+
+            UUIDValidator(self.value)
+            return True
+        except (ValueError, AttributeError):
+            return False
+
+    def _is_opaque(self) -> bool:
+        """Check if the token is a valid opaque token."""
+        return bool(re.match(self.OPAQUE_PATTERN, self.value))
 
     def __str__(self) -> str:
-        return self._value
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, (TokenString, str)):
-            return False
-        return str(self) == str(other)
-
-    def __hash__(self) -> int:
-        return hash(self._value)
+        return self.value
 
 
 @dataclass(frozen=True)
@@ -104,72 +106,83 @@ class TokenExpiry:
     expires_at: datetime
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         """Validate the expiry time."""
-        if not self.expires_at.tzinfo:
-            raise ValueError("expires_at must be timezone-aware")
-        if not self.created_at.tzinfo:
-            raise ValueError("created_at must be timezone-aware")
+        if self.expires_at.tzinfo is None:
+            self.expires_at = self.expires_at.replace(tzinfo=timezone.utc)
         if self.expires_at <= self.created_at:
-            raise ValueError("expires_at must be in the future")
+            raise ValueError("Expiry time must be in the future")
 
     @classmethod
     def from_now(
         cls, seconds: int, created_at: Optional[datetime] = None
-    ) -> TokenExpiry:
-        """Create an expiry from now plus the given seconds."""
-        created = created_at or datetime.now(timezone.utc)
-        expires_at = created + timedelta(seconds=seconds)
-        return cls(expires_at=expires_at, created_at=created)
+    ) -> "TokenExpiry":
+        """Create an expiry from now plus the given seconds.
 
-    @property
+        Args:
+            seconds: Number of seconds until expiry
+            created_at: Optional creation time (defaults to now)
+
+        Returns:
+            A new TokenExpiry instance
+        """
+        created = created_at or datetime.now(timezone.utc)
+        return cls(
+            expires_at=created + timedelta(seconds=seconds),
+            created_at=created,
+        )
+
     def is_expired(self) -> bool:
         """Check if the token has expired."""
         return datetime.now(timezone.utc) >= self.expires_at
 
-    @property
-    def ttl_seconds(self) -> int:
+    def ttl_seconds(self) -> float:
         """Get time to live in seconds."""
-        return int((self.expires_at - datetime.now(timezone.utc)).total_seconds())
+        return (self.expires_at - datetime.now(timezone.utc)).total_seconds()
 
 
 @dataclass(frozen=True)
 class TokenScope:
     """Value object representing token scopes."""
 
-    scopes: set[str] = field(default_factory=set)
+    scopes: Set[str] = field(default_factory=set)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         """Validate scopes."""
-        if not all(isinstance(scope, str) for scope in self.scopes):
-            raise ValueError("All scopes must be strings")
+        if not isinstance(self.scopes, set):
+            # Use object.__setattr__ to modify the frozen dataclass
+            object.__setattr__(self, 'scopes', set(self.scopes or []))
 
     def has_scope(self, scope: str) -> bool:
         """Check if the token has the given scope."""
-        return scope in self.scopes
+        return "*" in self.scopes or scope in self.scopes
 
     def has_any_scope(self, *scopes: str) -> bool:
         """Check if the token has any of the given scopes."""
+        if "*" in self.scopes:
+            return True
         return any(scope in self.scopes for scope in scopes)
 
     def has_all_scopes(self, *scopes: str) -> bool:
         """Check if the token has all of the given scopes."""
+        if "*" in self.scopes:
+            return True
         return all(scope in self.scopes for scope in scopes)
 
-    def add(self, scope: str) -> TokenScope:
+    def add(self, scope: str) -> "TokenScope":
         """Return a new TokenScope with the added scope."""
-        new_scopes = set(self.scopes)
+        new_scopes = self.scopes.copy()
         new_scopes.add(scope)
         return TokenScope(new_scopes)
 
-    def remove(self, scope: str) -> TokenScope:
+    def remove(self, scope: str) -> "TokenScope":
         """Return a new TokenScope with the scope removed."""
-        new_scopes = set(self.scopes)
+        new_scopes = self.scopes.copy()
         new_scopes.discard(scope)
         return TokenScope(new_scopes)
 
     def __contains__(self, scope: str) -> bool:
-        return scope in self.scopes
+        return self.has_scope(scope)
 
     def __iter__(self):
         return iter(self.scopes)

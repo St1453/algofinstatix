@@ -8,35 +8,28 @@ and the domain services.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, TypeVar
+from typing import Callable, Dict
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.shared.infrastructure.database.session import get_db
 from src.users.domain.exceptions import (
-    InvalidCredentialsError,
     UserAlreadyExistsError,
     UserNotFoundError,
     UserUpdateError,
 )
-from src.users.domain.schemas.user_schemas import (
-    ChangePasswordRequest,
-    UserProfile,
-    UserRegisterRequest,
+from src.users.domain.interfaces import (
+    IEmailService,
+    ITokenService,
+    IUserRegistrationService,
+    IUserService,
 )
+from src.users.domain.interfaces.unit_of_work import IUnitOfWork
+from src.users.domain.schemas.user_schemas import UserProfile, UserRegisterRequest
+from src.users.domain.services.user_registration_service import UserRegistrationService
 from src.users.domain.services.user_service import UserService
-from src.users.domain.value_objects.hashed_password import HashedPassword
-from src.users.domain.value_objects.password_utils import generate_temp_password
-from src.users.domain.value_objects.user_status import UserStatus
-from src.users.infrastructure.database.repositories.user_repository_impl import (
-    UserRepositoryImpl,
-)
 
-# Configure logger
 logger = logging.getLogger(__name__)
-T = TypeVar("T")  # For generic type hints
 
 
 class UserManagement:
@@ -44,96 +37,80 @@ class UserManagement:
 
     This class serves as the main entry point for user-related operations,
     handling the coordination between the API layer and the domain services.
+    It strictly follows the Unit of Work pattern for transaction management.
 
     Features:
-    - Transaction management
+    - Transaction management via Unit of Work
     - Error handling and logging
-    - Session lifecycle management
+    - Clean separation of concerns
     """
 
-    def __init__(self, db_session: Optional[AsyncSession] = None):
-        """Initialize with an optional database session.
+    def __init__(
+        self,
+        uow_factory: Callable[[], IUnitOfWork],
+        user_service: IUserService,
+        user_registration_service: IUserRegistrationService,
+        token_service: ITokenService,
+        email_service: IEmailService,
+    ) -> None:
+        """Initialize with all required dependencies.
 
         Args:
-            db_session: Optional SQLAlchemy async session. If not provided,
-                      a new one will be created when needed.
+            uow_factory: Callable that returns a new Unit of Work instance
+            user_service: Service for user-related operations
+            user_registration_service: Service for user registration operations
+            token_service: Service for token operations
+            email_service: Service for sending emails
         """
-        self._session = db_session
-        self._user_repository: Optional[UserRepositoryImpl] = None
-        self._user_service: Optional[UserService] = None
-        self._user_status: Optional[UserStatus] = None
-
-    @property
-    def user_repository(self) -> UserRepositoryImpl:
-        """Lazy initialization of user repository."""
-        if self._user_repository is None:
-            if self._session is None:
-                self._session = get_db()
-            self._user_repository = UserRepositoryImpl(self._session)
-        return self._user_repository
+        self._uow_factory = uow_factory
+        self._user_service = user_service
+        self._user_registration_service = user_registration_service
+        self._token_service = token_service
+        self._email_service = email_service
+        self._uow: IUnitOfWork | None = None
 
     @property
     def user_service(self) -> UserService:
-        """Lazy initialization of user service."""
-        if self._user_service is None:
-            self._user_service = UserService(self.user_repository)
+        """Get the user service instance."""
         return self._user_service
 
     @property
-    def user_status(self) -> UserStatus:
-        """Lazy initialization of user status."""
-        if self._user_status is None:
-            self._user_status = UserStatus()
-        return self._user_status
-
-    @classmethod
-    async def create(cls, session: Optional[AsyncSession] = None) -> "UserManagement":
-        """Create a new UserManagement instance.
-
-        Args:
-            session: Optional existing session. If None, a new one will be created.
-
-        Returns:
-            UserManagement: A new instance of UserManagement
-        """
-        return cls(session)
+    def user_registration_service(self) -> UserRegistrationService:
+        """Get the user registration service instance."""
+        return self._user_registration_service
 
     async def __aenter__(self) -> "UserManagement":
-        """Context manager entry."""
+        """Context manager entry.
+
+        Returns:
+            UserManagement: The UserManagement instance
+        """
+        if self._uow is None and self._uow_factory:
+            self._uow = self._uow_factory()
+            await self._uow.__aenter__()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit, ensures proper cleanup."""
-        if self._user_repository is not None:
-            await self._user_repository.close()
+        """Context manager exit, ensures proper cleanup.
 
-    async def is_healthy(self) -> bool:
-        """Check if the database connection is healthy.
-
-        Returns:
-            bool: True if the database is responsive
-
-        Raises:
-            HTTPException: If health check fails
+        Args:
+            exc_type: Exception type if an exception was raised
+            exc_val: Exception value if an exception was raised
+            exc_tb: Exception traceback if an exception was raised
         """
-        try:
-            if self._user_repository is None:
-                self._user_repository = UserRepositoryImpl(await get_db().__anext__())
-            return await self._user_repository.is_healthy()
-        except Exception as e:
-            logger.error(f"Health check failed: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database connection is not available",
-            ) from e
-
-    # User CRUD Operations
+        if self._uow:
+            try:
+                if exc_type is not None:  # If there was an exception
+                    await self._uow.rollback()
+                await self._uow.__aexit__(exc_type, exc_val, exc_tb)
+            finally:
+                self._uow = None
 
     async def register_user(
         self,
         user_data: UserRegisterRequest,
     ) -> UserProfile:
-        """Register a new user.
+        """Register a new user and send verification email.
 
         Args:
             user_data: User registration data
@@ -145,8 +122,40 @@ class UserManagement:
             HTTPException: If registration fails
         """
         try:
-            user = await self.user_service.register_user(user_data)
-            return UserProfile.model_validate(user.__dict__)
+            if not self._uow:
+                self._uow = self._uow_factory()
+
+            async with self._uow.transaction():
+                # Register the user
+                user = await self.user_registration_service.register_user(user_data)
+                """
+
+                # Create email verification token
+                verification_token = (
+                    await self._token_service.create_email_verification_token(
+                        user, {"user_agent": "user-registration"}
+                    )
+                )
+
+                # Send verification email (in background)
+                try:
+                    await self._email_service.send_verification_email(
+                        email=user.email,
+                        token=verification_token,
+                        username=user.username,
+                    )
+                except Exception as email_error:
+                    logger.error(
+                        "Failed to send verification email: %s",
+                        str(email_error),
+                        exc_info=True,
+                    )
+                    # Don't fail registration if email sending fails
+                    # The user can request a new verification email later
+                """
+
+                return UserProfile.model_validate(user.__dict__)
+
         except UserAlreadyExistsError as e:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail=str(e)
@@ -169,8 +178,17 @@ class UserManagement:
             HTTPException: If user is not found
         """
         try:
-            user = await self.user_service.get_user_by_id(str(user_id))
-            return UserProfile.model_validate(user.__dict__)
+            if not self._uow:
+                self._uow = self._uow_factory()
+
+            async with self._uow.transaction():
+                user = await self.user_service.get_user_by_id(user_id)
+                if not user:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"User with ID {user_id} not found",
+                    )
+                return UserProfile.model_validate(user.__dict__)
         except UserNotFoundError as e:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=str(e) or "User not found"
@@ -180,7 +198,7 @@ class UserManagement:
         self,
         user_id: str,
         user_data: UserProfile,
-    ) -> Dict:
+    ) -> UserProfile:
         """Update the current user's profile information.
 
         Args:
@@ -197,8 +215,23 @@ class UserManagement:
                 - 500 for other errors
         """
         try:
-            updated_user = await self.user_service.update_user(user_id, user_data)
-            return UserProfile.model_validate(updated_user.__dict__)
+            if not self._uow:
+                self._uow = self._uow_factory()
+
+            async with self._uow.transaction():
+                # Get existing user
+                existing_user = await self.user_service.get_user_by_id(user_id)
+                if not existing_user:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"User with ID {user_id} not found",
+                    )
+
+                # Update user data
+                updated_user = await self.user_service.update_my_profile(
+                    user_id, user_data.model_dump(exclude_unset=True)
+                )
+                return UserProfile.model_validate(updated_user.__dict__)
 
         except UserNotFoundError as e:
             raise HTTPException(
@@ -240,19 +273,21 @@ class UserManagement:
                 - 500 for other errors
         """
         try:
-            # Verify user exists and has permission
-            await self.user_service.get_user_by_id(user_id)
+            if not self._uow:
+                self._uow = self._uow_factory()
 
-            # Perform soft delete
-            success = await self.user_service.delete_user(user_id)
+            async with self._uow.transaction():
+                # Check if user exists
+                existing_user = await self.user_service.get_user_by_id(user_id)
+                if not existing_user:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"User with ID {user_id} not found",
+                    )
 
-            if not success:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to delete profile",
-                )
-
-            return {"message": "Profile deleted successfully"}
+                # Soft delete the user
+                await self.user_service.delete_my_profile(user_id)
+                return {"message": "Profile deleted successfully"}
 
         except UserNotFoundError as e:
             raise HTTPException(
@@ -270,164 +305,3 @@ class UserManagement:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="An error occurred while deleting your profile",
             ) from e
-
-    # Authentication & Authorization
-
-    async def authenticate_user(
-        self, email: str, password: str
-    ) -> Optional[UserProfile]:
-        """Authenticate a user with email and password.
-
-        Args:
-            email: User's email
-            password: User's password
-
-        Returns:
-            UserResponse if authentication succeeds, None otherwise
-
-        Raises:
-            HTTPException: If authentication fails
-        """
-        try:
-            user = await self.user_service.authenticate_user(email, password)
-            # Record the successful login
-            # make sure to return tokens when authentication is successful
-
-            # returning UserProfile is temporary for now
-            if user:
-                await self.user_status.record_successful_login(str(user.id))
-                return UserProfile.model_validate(user.__dict__)
-            return None
-        except (UserNotFoundError, InvalidCredentialsError) as e:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password",
-            ) from e
-
-    async def change_password(
-        self, user_id: str, password_data: ChangePasswordRequest
-    ) -> Dict[str, str]:
-        """Change the current user's password.
-
-        Args:
-            user_id: The ID of the user changing their password
-            password_data: Object containing current and new password
-
-        Returns:
-            Dict with success message
-
-        Raises:
-            HTTPException: If password change fails
-        """
-        try:
-            await self.user_service.change_password(
-                user_id=user_id,
-                current_password=password_data.current_password,
-                new_password=password_data.new_password,
-            )
-            return {"message": "Password updated successfully"}
-
-        except (UserNotFoundError, InvalidCredentialsError) as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=str(e),
-            ) from e
-        except Exception as e:
-            logger.error(f"Failed to change password: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="An error occurred while changing password",
-            ) from e
-
-
-async def verify_email(self, user_id: str) -> UserProfile:
-    """Mark a user's email as verified.
-
-    Args:
-        user_id: ID of the user to verify
-
-    Returns:
-        UserProfile: The updated user profile
-
-    Raises:
-        HTTPException:
-            - 404 if user not found
-            - 400 if verification fails
-            - 500 for unexpected errors
-    """
-    try:
-        # Get the user
-        user = await self.user_repository.get_user_by_id(user_id)
-        if not user:
-            raise UserNotFoundError(f"User with ID {user_id} not found")
-
-        # Use domain model's verify_email method
-        verified_user = user.verify_email()
-
-        # Save changes
-        await self.user_repository.update_user(verified_user)
-
-        logger.info(f"Email verified for user ID: {user_id}")
-        return UserProfile.model_validate(verified_user.__dict__)
-
-    except UserNotFoundError as e:
-        logger.warning(f"User not found for email verification: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
-    except ValueError as e:
-        logger.warning(f"Email verification failed: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
-        ) from e
-    except Exception as e:
-        logger.error(f"Unexpected error during email verification: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while verifying email",
-        ) from e
-
-
-async def reset_password(self, user_id: str) -> Dict[str, str]:
-    """Reset a user's password to a temporary value.
-
-    Args:
-        user_id: The ID of the user to reset the password for
-
-    Returns:
-        Dict with success message and temporary password
-
-    Raises:
-        HTTPException:
-            - 404 if user not found
-            - 500 for unexpected errors
-    """
-    try:
-        # Generate a new temporary password
-        temp_password = generate_temp_password()
-
-        # Get the user
-        user = await self.user_repository.get_user_by_id(user_id)
-        if not user:
-            raise UserNotFoundError(f"User with ID {user_id} not found")
-
-        # Update user's password using the domain model
-        hashed_password = HashedPassword.from_plaintext(temp_password)
-        updated_user = user.with_updates(hashed_password=hashed_password)
-
-        # Save changes
-        await self.user_repository.update_user(updated_user)
-
-        logger.info(f"Password reset for user ID: {user_id}")
-        return {
-            "message": "Password reset successful",
-            "temporary_password": temp_password,
-        }
-
-    except UserNotFoundError as e:
-        logger.warning(f"User not found for password reset: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
-    except Exception as e:
-        logger.error(f"Error resetting password: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while resetting password",
-        ) from e

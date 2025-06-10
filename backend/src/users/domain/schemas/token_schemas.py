@@ -8,26 +8,15 @@ authentication, and authorization in the system.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
-
-
-class TokenType(str, Enum):
-    """Types of tokens supported by the system."""
-
-    ACCESS = "access"
-    REFRESH = "refresh"
-    EMAIL_VERIFICATION = "email_verification"
-    PASSWORD_RESET = "password_reset"
-    API = "api"
 
 
 class TokenBase(BaseModel):
     """Base schema for token data."""
 
-    token_type: TokenType = Field(..., description="Type of the token")
+    token_type: str = Field(..., description="Type of the token")
     scopes: List[str] = Field(
         default_factory=list, description="List of scopes this token has access to"
     )
@@ -38,7 +27,7 @@ class TokenBase(BaseModel):
 
 class TokenCreate(TokenBase):
     """Schema for token creation.
-    
+
     This is used when generating new tokens for authentication.
     """
 
@@ -71,7 +60,7 @@ class TokenCreate(TokenBase):
 
 class TokenResponse(TokenBase):
     """Schema for token response.
-    
+
     This is what's returned to the client after successful authentication.
     """
 
@@ -99,7 +88,7 @@ class TokenResponse(TokenBase):
 
 class TokenPayload(BaseModel):
     """Schema for the payload of a JWT token.
-    
+
     This represents the data that will be encoded in the token.
     """
 
@@ -113,17 +102,13 @@ class TokenPayload(BaseModel):
     iat: Optional[datetime] = Field(
         None, description="Issued at time (as UTC timestamp)"
     )
-    jti: Optional[str] = Field(
-        None, description="Unique identifier for the token"
-    )
-    token_type: Optional[TokenType] = Field(
-        None, description="Type of the token"
-    )
+    jti: Optional[str] = Field(None, description="Unique identifier for the token")
+    token_type: Optional[str] = Field(None, description="Type of the token")
 
 
 class TokenRefreshRequest(BaseModel):
     """Schema for token refresh request.
-    
+
     Used when refreshing an access token using a refresh token.
     """
 
@@ -131,16 +116,14 @@ class TokenRefreshRequest(BaseModel):
 
     model_config = {
         "json_schema_extra": {
-            "example": {
-                "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-            }
+            "example": {"refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."}
         }
     }
 
 
 class TokenRevokeRequest(BaseModel):
     """Schema for token revocation request.
-    
+
     Used when revoking a token (usually for logout).
     """
 
@@ -148,9 +131,7 @@ class TokenRevokeRequest(BaseModel):
 
     model_config = {
         "json_schema_extra": {
-            "example": {
-                "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-            }
+            "example": {"token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."}
         }
     }
 
@@ -178,6 +159,16 @@ class TokenInDB(TokenBase):
 
     class Config:
         from_attributes = True
+
+
+class TokenVerificationResult:
+    """Result of token verification."""
+
+    is_valid: bool
+    user_id: Optional[str] = None
+    token: Optional[str] = None
+    payload: Optional[Dict] = None
+    error: Optional[str] = None
 
 
 class TokenList(BaseModel):

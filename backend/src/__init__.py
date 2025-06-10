@@ -3,6 +3,7 @@
 This is the root package for the AlgoFinStatiX backend application.
 It contains all the modules and subpackages for the application.
 """
+
 from __future__ import annotations
 
 import logging
@@ -12,12 +13,12 @@ __version__ = "0.1.0"
 
 # Public API
 try:
-    from src.shared.infrastructure.config import settings  # noqa: F401
+    from src.core.config import get_settings
 
-    __all__ = ["__version__", "settings"]
+    __all__ = ["__version__", "get_settings"]
 except ImportError:
     __all__ = ["__version__"]
-    settings = None  # type: ignore[assignment]
+    get_settings = None  # type: ignore[assignment]
 
 # Configure logging
 logging.basicConfig(

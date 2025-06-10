@@ -1,79 +1,126 @@
-"""Factory for creating user roles with predefined permission sets."""
+"""Factory for creating user roles with predefined permission sets.
 
-from .policies import Permission, UserRole
+This module provides the UserRoleFactory class which is responsible for creating
+standardized user roles with predefined permission sets. It ensures consistency
+in role definitions across the application.
+"""
+
+from enum import Enum
+from typing import Type, TypeVar
+
+from .policies import Permission
+from .user_role import UserRole
+
+T = TypeVar("T", bound="UserRoleFactory")
+
+
+class RoleType(str, Enum):
+    """Enumeration of role types with their display names."""
+
+    USER = "user"
+    ADMIN = "admin"
+    MODERATOR = "moderator"
 
 
 class UserRoleFactory:
-    """Factory class for creating predefined user roles with associated permissions.
+    """Fluent interface for creating user roles with type safety.
 
-    This factory provides static methods to create standard user roles with predefined
-    permission sets, ensuring consistency across the application.
+    This class provides a type-safe way to create user roles using a fluent interface.
+    Example usage:
+        role = UserRoleFactory.get_role().user()  # Returns a standard user role
     """
 
-    @staticmethod
-    def user() -> UserRole:
-        """Create a standard user role with basic permissions.
+    @classmethod
+    def get_role(cls: Type[T]) -> T:
+        """Start building a role with type safety.
 
-        Standard users can manage their own account but cannot access other users' data.
+        Returns:
+            RoleFactory: A new instance of RoleFactory for method chaining
+
+        Example:
+            >>> role = UserRoleFactory.get_role().user()
+            >>> role.name
+            'user'
+        """
+        return cls()
+
+    def user(self) -> UserRole:
+        """Create a standard user role with basic permissions.
 
         Returns:
             UserRole: A UserRole instance with standard user permissions
         """
-        return UserRole(
-            "user",
-            {
-                Permission.READ_OWN,
-                Permission.UPDATE_OWN,
-                Permission.DELETE_OWN,
-            },
-        )
+        return self._create_role(RoleType.USER)
 
-    @staticmethod
-    def admin() -> UserRole:
+    def admin(self) -> UserRole:
         """Create an admin role with full permissions.
-
-        Admin users have full access to all user management features.
 
         Returns:
             UserRole: A UserRole instance with admin permissions
         """
+        return self._create_role(RoleType.ADMIN)
+
+    def moderator(self) -> UserRole:
+        """Create a moderator role with elevated permissions.
+
+        Returns:
+            UserRole: A UserRole instance with moderator permissions
+        """
+        return self._create_role(RoleType.MODERATOR)
+
+    def create_default_role(self) -> UserRole:
+        """Create a default role for a user.
+
+        Returns:
+            UserRole: A UserRole instance with default permissions
+        """
+        return self._create_role(RoleType.USER)
+
+    def _create_role(self, role_type: RoleType) -> UserRole:
+        """Internal method to create a role based on type.
+
+        Args:
+            role_type: The type of role to create
+
+        Returns:
+            UserRole: The created UserRole instance
+        """
+        role_creators = {
+            RoleType.USER: self._create_user_role,
+            RoleType.ADMIN: self._create_admin_role,
+            RoleType.MODERATOR: self._create_moderator_role,
+        }
+        return role_creators[role_type]()
+
+    @staticmethod
+    def _create_user_role() -> UserRole:
         return UserRole(
-            "admin",
-            {
-                Permission.READ_OWN,
-                Permission.UPDATE_OWN,
-                Permission.DELETE_OWN,
-                Permission.READ_ANY,
-                Permission.UPDATE_ANY,
-                Permission.DELETE_ANY,
-                Permission.CREATE_ACCOUNT_FULL,
-            },
+            RoleType.USER,
+            frozenset(
+                {
+                    Permission.READ_OWN,
+                    Permission.UPDATE_OWN,
+                    Permission.DELETE_OWN,
+                }
+            ),
         )
 
     @staticmethod
-    def get_role(role_name: str) -> UserRole:
-        """Get a role by name.
-        
-        Args:
-            role_name: Name of the role to retrieve (e.g., 'user', 'admin')
-            
-        Returns:
-            UserRole: The corresponding UserRole instance
-            
-        Raises:
-            ValueError: If the role name is not recognized
-            
-        Example:
-            >>> role = UserRoleFactory.get_role('admin')
-            >>> role.name
-            'admin'
-        """
-        role_creators = {
-            'user': UserRoleFactory.user,
-            'admin': UserRoleFactory.admin,
-        }
-        
-        if role_name not in role_creators:
-            raise ValueError(f"Unknown role: {role_name}")
-            
-        return role_creators[role_name]()
+    def _create_admin_role() -> UserRole:
+        return UserRole(
+            RoleType.ADMIN,
+            frozenset(Permission),  # All permissions
+        )
+
+    @staticmethod
+    def _create_moderator_role() -> UserRole:
+        return UserRole(
+            RoleType.MODERATOR,
+            frozenset(
+                {
+                    Permission.READ_ANY,
+                    Permission.UPDATE_ANY,
+                    Permission.DELETE_ANY,
+                }
+            ),
+        )

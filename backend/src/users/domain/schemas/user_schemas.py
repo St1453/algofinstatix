@@ -7,13 +7,9 @@ in the user management system.
 
 from __future__ import annotations
 
-from typing import Optional, TypeVar
+from typing import Any, Optional
 
-from email_validator import EmailNotValidError, validate_email
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-
-# Type variable for model validation
-ModelData = TypeVar("ModelData", bound=dict)
+from pydantic import BaseModel, Field, field_validator
 
 
 class UserProfile(BaseModel):
@@ -21,25 +17,29 @@ class UserProfile(BaseModel):
     it can be used when user is updated or registered
     """
 
-    email: EmailStr = Field(
+    email: str = Field(
         ..., description="User's email address", example="user@example.com"
     )
-    first_name: str = Field(
-        ...,
+    first_name: Optional[str] = Field(
+        None,
         min_length=1,
         max_length=100,
         description="User's first name",
         example="John",
     )
-    last_name: str = Field(
-        ..., min_length=1, max_length=100, description="User's last name", example="Doe"
+    last_name: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=100,
+        description="User's last name",
+        example="Doe",
     )
     username: str = Field(
         ...,
         min_length=3,
-        max_length=50,
-        pattern=r"^[a-zA-Z0-9_-]+$",
-        description="User's username (alphanumeric with underscores and hyphens only)",
+        max_length=32,
+        description="""User's username 
+        (alphanumeric with underscores and hyphens only, 3-32 chars)""",
         example="johndoe123",
     )
     profile_picture: Optional[str] = Field(
@@ -47,7 +47,7 @@ class UserProfile(BaseModel):
         description="URL to the user's profile picture",
         example="https://example.com/profile.jpg",
     )
-    user_intro: Optional[str] = Field(
+    bio: Optional[str] = Field(
         None,
         max_length=500,
         description="Brief introduction about the user",
@@ -55,16 +55,38 @@ class UserProfile(BaseModel):
     )
 
     @field_validator("email", mode="before")
-    def validate_email(cls, v: str) -> str:
-        """Validate email format."""
-        try:
-            validate_email(v)
-        except EmailNotValidError as e:
-            raise ValueError(str(e))
-        return v
+    def normalize_and_validate_email(cls, v: Any) -> str:
+        """Validate and normalize email address.
 
+        Args:
+            v: The email string to validate
 
-# user request models below
+        Returns:
+            str: Normalized email address in lowercase
+
+        Raises:
+            ValueError: If email is empty or invalid
+        """
+        if not v:
+            raise ValueError("Email is required")
+        return str(v)
+
+    @field_validator("username", mode="before")
+    def validate_username(cls, v: Any) -> str:
+        """Validate and normalize username.
+
+        Args:
+            v: The username string to validate
+
+        Returns:
+            str: Normalized username in lowercase
+
+        Raises:
+            ValueError: If username is empty or invalid
+        """
+        if not v:
+            raise ValueError("Username is required")
+        return str(v)
 
 
 class AuthenticatedUserRequest(BaseModel):
@@ -81,11 +103,28 @@ class AuthenticatedUserRequest(BaseModel):
     username: str = Field(
         ...,
         min_length=3,
-        max_length=50,
-        pattern=r"^[a-zA-Z0-9_-]+$",
-        description="User's username (alphanumeric with underscores and hyphens only)",
+        max_length=32,
+        description="""User's username 
+        (alphanumeric with underscores and hyphens only, 3-32 chars)""",
         example="johndoe123",
     )
+
+    @field_validator("username", mode="before")
+    def validate_username(cls, v: Any) -> str:
+        """Validate and normalize username.
+
+        Args:
+            v: The username string to validate
+
+        Returns:
+            str: Normalized username in lowercase
+
+        Raises:
+            ValueError: If username is empty or invalid
+        """
+        if not v:
+            raise ValueError("Username is required")
+        return str(v)
 
     # try to use access token later
 
@@ -123,25 +162,17 @@ class UserRegisterRequest(UserProfile):
         }
     }
 
-    @field_validator("password")
-    def validate_password_strength(cls, v: str) -> str:
-        """Validate password strength."""
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        if not any(c.isupper() for c in v):
-            raise ValueError("Password must contain at least one uppercase letter")
-        if not any(c.islower() for c in v):
-            raise ValueError("Password must contain at least one lowercase letter")
-        if not any(c.isdigit() for c in v):
-            raise ValueError("Password must contain at least one number")
-        return v
-
-    @field_validator(mode="before")
-    def passwords_match(cls, values: dict) -> dict:
+    @field_validator("password_confirm")
+    def passwords_match(cls, v: str, info: Any) -> str:
         """Ensure password and password_confirm match."""
-        if values["password"] != values["password_confirm"]:
+        if (
+            hasattr(info, "data")
+            and isinstance(info.data, dict)
+            and "password" in info.data
+            and v != info.data["password"]
+        ):
             raise ValueError("Passwords do not match")
-        return values
+        return v
 
 
 class UserLoginRequest(BaseModel):
@@ -149,12 +180,29 @@ class UserLoginRequest(BaseModel):
     This schema is used when a user logs in through the public API.
     """
 
-    email: EmailStr = Field(
+    email: str = Field(
         ..., description="User's email address", example="user@example.com"
     )
     password: str = Field(
         ..., description="User's password", example="YourSecurePassword123!"
     )
+
+    @field_validator("email", mode="before")
+    def normalize_login_email(cls, v: Any) -> str:
+        """Normalize and validate email during login.
+
+        Args:
+            v: The email string to validate
+
+        Returns:
+            str: Normalized email address in lowercase
+
+        Raises:
+            ValueError: If email is empty or invalid
+        """
+        if not v:
+            raise ValueError("Email is required")
+        return str(v)
 
     model_config = {
         "json_schema_extra": {
@@ -172,6 +220,8 @@ class ChangePasswordRequest(BaseModel):
     Used when a user wants to change their own password.
     Requires the current password for verification.
     """
+
+    id: str = Field(..., description="User's unique identifier")
 
     current_password: str = Field(
         ...,
@@ -197,6 +247,7 @@ class ChangePasswordRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
+                "id": "550e8400-e29b-41d4-a716-446655440000",
                 "current_password": "OldPassword123!",
                 "new_password": "NewSecurePass123!",
                 "new_password_confirm": "NewSecurePass123!",
@@ -204,33 +255,102 @@ class ChangePasswordRequest(BaseModel):
         }
     }
 
-    @model_validator(mode="after")
-    def new_passwords_match(self) -> "ChangePasswordRequest":
+    @field_validator("id", mode="before")
+    def validate_id(cls, v: Any) -> str:
+        """Validate and normalize user ID."""
+        if not v:
+            raise ValueError("User ID is required")
+        return str(v)
+
+    @field_validator("current_password", mode="before")
+    def validate_current_password(cls, v: Any) -> str:
+        """Validate and normalize current password."""
+        if not v:
+            raise ValueError("Current password is required")
+        return str(v)
+
+    @field_validator("new_password", mode="before")
+    def validate_new_password(cls, v: Any) -> str:
+        """Validate and normalize new password."""
+        if not v:
+            raise ValueError("New password is required")
+        return str(v)
+
+    @field_validator("new_password_confirm", mode="before")
+    def validate_new_password_confirm(cls, v: Any) -> str:
+        """Validate and normalize new password confirmation."""
+        if not v:
+            raise ValueError("New password confirmation is required")
+        return str(v)
+
+    @field_validator("new_password_confirm")
+    def passwords_match(cls, v: str, info: Any) -> str:
         """Ensure new password and confirmation match."""
-        if self.new_password != self.new_password_confirm:
+        if (
+            hasattr(info, "data")
+            and isinstance(info.data, dict)
+            and "new_password" in info.data
+            and v != info.data["new_password"]
+        ):
             raise ValueError("New passwords do not match")
-        return self
-
-    @field_validator("new_password")
-    def validate_new_password_strength(cls, v: str) -> str:
-        """Validate new password strength.
-
-        Ensures password meets security requirements:
-        - At least 8 characters long
-        - Contains at least one uppercase letter
-        - Contains at least one lowercase letter
-        - Contains at least one number
-        - Contains at least one special character
-        """
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        if not any(c.isupper() for c in v):
-            raise ValueError("Password must contain at least one uppercase letter")
-        if not any(c.islower() for c in v):
-            raise ValueError("Password must contain at least one lowercase letter")
-        if not any(c.isdigit() for c in v):
-            raise ValueError("Password must contain at least one number")
-        special_chars = "!@#$%^&*()_+{}|:<>?`~-=[]\\;',./\""
-        if not any(c in special_chars for c in v):
-            raise ValueError("Password must contain at least one special character")
         return v
+
+
+class VerifyEmailRequest(BaseModel):
+    """Request model for email verification."""
+
+    email: str = Field(..., description="User's email address")
+    username: str = Field(..., description="User's username")
+    token: str = Field(..., description="Verification token received via email")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "email": "user@example.com",
+                "username": "johndoe",
+                "token": "your-verification-token",
+            }
+        }
+    }
+
+
+class UserProfileResponse(UserProfile):
+    """Base schema with common user fields.
+    it can be used when user is updated or registered
+    """
+
+    id: str = Field(
+        ...,
+        description="User's unique identifier",
+        example="550e8400-e29b-41d4-a716-446655440000",
+    )
+
+
+class ChangePasswordResponse(BaseModel):
+    """Schema for changing password request.
+
+    Used when a user wants to change their own password.
+    Requires the current password for verification.
+    """
+
+    user_id: str
+
+    new_hashed_password: str
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "user_id": "550e8400-e29b-41d4-a716-446655440000",
+                "new_hashed_password": "NewSecurePass123!",
+            }
+        }
+    }
+
+
+class UserRegistrationInfo(UserProfile):
+    """Schema for user registration.
+    This schema is used when a new user registers.
+    It is used by infrastructure layer to create a new user.
+    """
+
+    hashed_password: str

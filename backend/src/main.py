@@ -5,13 +5,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from src.shared.infrastructure.config import settings
-from src.users.infrastructure.logging.database_logger import (
-    log_slow_query,
-    setup_database_logging,
+from src.core.config import get_settings
+from src.shared.infrastructure.logging.database_logger import (
+    get_database_logger,
 )
 from src.users.presentation import user_routes
 
@@ -20,7 +20,7 @@ from src.users.presentation import user_routes
 async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI application."""
     # Startup: Initialize database logging
-    setup_database_logging(settings)
+    get_database_logger()
 
     # Set up SQLAlchemy event listeners
     @event.listens_for(Engine, "before_cursor_execute")
@@ -33,7 +33,9 @@ async def lifespan(app: FastAPI):
     @event.listens_for(Engine, "after_cursor_execute")
     def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
         duration = time.time() - conn.info["query_start_time"].pop()
-        log_slow_query(query=statement, duration=duration, parameters=parameters)
+        get_database_logger().log_slow_query(
+            query=statement, duration=duration, parameters=parameters
+        )
 
     yield
     # Shutdown: Cleanup code can go here
@@ -55,16 +57,24 @@ app = FastAPI(
 # Set up CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=get_settings().CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # Include API routers
 app.include_router(
     user_routes.router,
+    prefix="",
 )
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect to API documentation."""
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health", include_in_schema=False)

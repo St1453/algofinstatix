@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}Verify Your Email - AlgoFinStatiX{% endblock %}
+
+{% block content %}
+<h2 style="color: #2c3e50;">Email Verification</h2>
+<p>Hello {{ username | default("there") }},</p>
+<p>Thank you for registering with AlgoFinStatiX. Please verify your email address by clicking the button below:</p>
+<p style="text-align: center; margin: 25px 0;">
+    <a href="{{ verification_url }}" class="button">
+        Verify Email Address
+    </a>
+</p>
+<p>Or copy and paste this link into your browser:<br>
+    <code
+        style="background-color: #f1f1f1; padding: 2px 4px; border-radius: 3px; word-break: break-all; display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis;">{{ verification_url }}</code>
+</p>
+<p>This link will expire in 24 hours.</p>
+<p>If you didn't create an account with AlgoFinStatiX, please ignore this email.</p>
+{% endblock %}
