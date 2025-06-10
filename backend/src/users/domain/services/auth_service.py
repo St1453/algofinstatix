@@ -1,169 +1,252 @@
-"""Authentication service for user authentication and session management."""
+"""Authentication and token management service."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
+from uuid import UUID
 
-from jose import JWTError, jwt
 from pydantic import EmailStr
 
-from src.core.config import settings
+from src.users.domain.entities.token import Token
 from src.users.domain.entities.user import User
 from src.users.domain.exceptions import (
-    AccountLockedError,
+    AccountDisabledError,
     AccountNotVerifiedError,
     AuthenticationError,
     InvalidCredentialsError,
-    UserNotFoundError,
+    TokenError,
 )
-from src.users.domain.interfaces.user_repository import IUserRepository
-from src.users.domain.services.base_user_service import BaseUserService
-from src.users.domain.value_objects.hashed_password import HashedPassword
+from src.users.domain.interfaces.auth_service import IAuthService
+from src.users.domain.interfaces.password_service import IPasswordService
+from src.users.domain.interfaces.token_service import ITokenService
+from src.users.domain.interfaces.unit_of_work import IUnitOfWork
 
 logger = logging.getLogger(__name__)
 
 
-class AuthService(BaseUserService):
-    """Service handling user authentication and session management."""
+class AuthService(IAuthService):
+    """Handles authentication and token management.
+
+    This service is responsible for:
+    - User authentication
+    - Token pair generation and validation
+    - Token revocation
+    """
 
     def __init__(
         self,
-        user_repository: IUserRepository,
-        secret_key: str = settings.SECRET_KEY,
-        algorithm: str = settings.ALGORITHM,
-        access_token_expire_minutes: int = settings.ACCESS_TOKEN_EXPIRE_MINUTES,
-    ):
-        """Initialize auth service with configuration."""
-        super().__init__(user_repository)
-        self.secret_key = secret_key
-        self.algorithm = algorithm
-        self.access_token_expire_minutes = access_token_expire_minutes
+        password_service: IPasswordService,
+        token_service: ITokenService,
+        uow: IUnitOfWork,
+    ) -> None:
+        """Initialize with required dependencies.
+
+        Args:
+            password_service: Password service for hashing/verification
+            token_service: Service for token operations
+            uow: Unit of Work for transaction management
+        """
+        self.password_service = password_service
+        self.token_service = token_service
+        self.uow = uow
 
     async def authenticate_user(
         self,
         email: EmailStr,
         password: str,
-        require_verified_email: bool = True,
-    ) -> User:
-        """Authenticate a user with email and password.
+        request_info: Optional[Dict[str, str]] = None,
+    ) -> Tuple[User, Dict[str, str]]:
+        """Authenticate a user with email and password and create a new session.
 
         Args:
             email: User's email
-            password: Plain text password
-            require_verified_email: Whether to require email verification
+            password: User's password
 
         Returns:
-            User: Authenticated user
+            Tuple of (User, token_data) if authentication is successful
 
         Raises:
-            UserNotFoundError: If user doesn't exist
-            AccountNotVerifiedError: If email verification is required but not completed
-            AccountLockedError: If account is locked due to too many failed attempts
-            InvalidCredentialsError: If credentials are invalid
-            AuthenticationError: For other authentication errors
+            InvalidCredentialsError: If email or password is incorrect
+            AccountDisabledError: If the account is disabled
+            AuthenticationError: If authentication fails for any other reason
         """
         try:
-            # Get user by email
-            user = await self._get_user_by_email(email)
+            async with self.uow.transaction():
+                # Get user by email
+                user = await self.uow.users.get_user_by_email(email)
+                if not user:
+                    logger.warning("Login attempt with non-existent email: %s", email)
+                    raise InvalidCredentialsError("Invalid email or password")
 
-            # Check if account is locked
-            if user.status.is_locked:
-                logger.warning("Login attempt for locked account: %s", email)
-                raise AccountLockedError(
-                    f"Account is locked. Please try again later or reset your password."
-                )
+                # Check if account is enabled
+                if not user.status.is_enabled:
+                    logger.warning("Login attempt for disabled account: %s", email)
+                    raise AccountDisabledError("Account is disabled")
 
-            # Check email verification
-            if require_verified_email and not user.status.is_verified:
-                logger.info("Login attempt with unverified email: %s", email)
-                raise AccountNotVerifiedError(
-                    "Please verify your email before logging in"
-                )
+                # Verify password
+                if not await self.password_service.verify_password(
+                    password, user.hashed_password
+                ):
+                    logger.warning("Invalid password for user: %s", email)
+                    raise InvalidCredentialsError("Invalid email or password")
 
-            # Verify password
-            if not user.hashed_password.verify(password):
-                # Record failed attempt
-                user.status.record_failed_login()
-                await self.user_repository.update_user(user.id, {"status": user.status})
-                
-                remaining = user.status.remaining_attempts
-                error_msg = f"Invalid credentials. {remaining} attempts remaining."
-                logger.warning(
-                    "Failed login attempt for user %s. %s attempts remaining.",
-                    email,
-                    remaining,
-                )
-                raise InvalidCredentialsError(error_msg)
+                # Check if email is verified if required
+                if not user.status.is_verified:
+                    logger.warning("Login attempt with unverified email: %s", email)
+                    raise AccountNotVerifiedError("Please verify your email first")
 
-            # Authentication successful - update last login
-            user.status.record_successful_login()
-            await self.user_repository.update_user(user.id, {
-                "last_login_at": datetime.now(timezone.utc),
-                "status": user.status
-            })
-            
-            logger.info("Successful login for user: %s", email)
-            return user
+                # Generate token pair
+                token_data = await self.create_token_pair(user)
+                access_token, refresh_token, _, _ = token_data
 
-        except (UserNotFoundError, AccountNotVerifiedError, AccountLockedError, InvalidCredentialsError):
+                return user, {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "token_type": "bearer",
+                }
+
+        except (InvalidCredentialsError, AccountDisabledError, AccountNotVerifiedError):
+            # Re-raise expected exceptions
             raise
         except Exception as e:
             logger.error(
                 "Unexpected error during authentication for %s: %s",
                 email,
                 str(e),
-                exc_info=True,
             )
             raise AuthenticationError("An error occurred during authentication") from e
 
-    def create_access_token(self, user: User) -> str:
-        """Create a JWT access token for the user.
-        
-        Args:
-            user: User to create token for
-            
-        Returns:
-            str: JWT access token
-        """
-        expires_delta = timedelta(minutes=self.access_token_expire_minutes)
-        expire = datetime.now(timezone.utc) + expires_delta
-        
-        to_encode = {
-            "sub": str(user.id),
-            "email": user.email,
-            "exp": expire,
-            "type": "access",
-        }
-        
-        return jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+    async def create_token_pair(
+        self,
+        user: User,
+        request_info: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, str, Token, Token]:
+        """Create access and refresh token pair for a user.
 
-    async def verify_token(self, token: str) -> Tuple[bool, Optional[User]]:
-        """Verify a JWT token and return the associated user.
-        
         Args:
-            token: JWT token to verify
-            
+            user: The authenticated user
+            request_info: Optional request metadata (e.g., user_agent, ip_address)
+
         Returns:
-            Tuple[bool, Optional[User]]: (is_valid, user)
+            Tuple containing:
+            - access_token: JWT access token
+            - refresh_token: Opaque refresh token
+            - access_token_entity: Access token entity
+            - refresh_token_entity: Refresh token entity
         """
         try:
-            payload = jwt.decode(
-                token, 
-                self.secret_key, 
-                algorithms=[self.algorithm]
+            # Create refresh token first
+            refresh_result = await self.token_service.create_refresh_token(
+                user=user,
+                request_info=request_info,
             )
-            
-            user_id = payload.get("sub")
-            if not user_id:
-                return False, None
-                
-            try:
-                user = await self._get_user_by_id(user_id)
-                return True, user
-            except UserNotFoundError:
-                return False, None
-                
-        except JWTError:
-            return False, None
+            refresh_token_str, refresh_token = refresh_result
+
+            # Create access token with refresh token ID
+            access_result = await self.token_service.create_access_token(
+                user=user,
+                refresh_token_id=refresh_token.id,
+                request_info=request_info,
+            )
+            access_token_str, access_token = access_result
+
+            return {
+                "access_token": access_token_str,
+                "refresh_token": refresh_token_str,
+                "token_type": "bearer",
+            }
+
+        except Exception as e:
+            logger.error(
+                "Error creating token pair for user %s: %s",
+                user.id,
+                str(e),
+                exc_info=True,
+            )
+            raise AuthenticationError("Failed to create token pair") from e
+
+    async def refresh_token_pair(
+        self,
+        refresh_token: str,
+        request_info: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, str, Token, Token]:
+        """Refresh an access token using a valid refresh token.
+
+        Args:
+            refresh_token: Valid refresh token
+            request_info: Optional request metadata
+
+        Returns:
+            Tuple containing new access_token, refresh_token, and their entities
+
+        Raises:
+            TokenError: If refresh token is invalid or expired
+            AuthenticationError: If refresh fails
+        """
+        try:
+            async with self.uow.transaction():
+                # Verify and get refresh token entity
+                token_entity = await self.uow.tokens.get_by_token(refresh_token)
+                if not token_entity or token_entity.is_revoked:
+                    raise TokenError("Invalid or expired refresh token")
+
+                # Get user associated with the token
+                user = await self.uow.users.get_user_by_id(token_entity.user_id)
+                if not user:
+                    raise TokenError("User not found")
+
+                # Revoke the old refresh token
+                await self.token_service.revoke_token(refresh_token)
+
+                # Create new token pair
+                return await self.create_token_pair(user, request_info)
+
+        except TokenError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Error refreshing token: %s",
+                str(e),
+                exc_info=True,
+            )
+            raise AuthenticationError("Failed to refresh token") from e
+
+    async def revoke_token(self, token: str) -> bool:
+        """Revoke a specific token.
+
+        Args:
+            token: The token to revoke
+
+        Returns:
+            bool: True if token was successfully revoked
+        """
+        try:
+            return await self.token_service.revoke_token(token)
+        except Exception as e:
+            logger.error(
+                "Error revoking token: %s",
+                str(e),
+                exc_info=True,
+            )
+            return False
+
+    async def revoke_all_tokens(self, user_id: UUID) -> int:
+        """Revoke all tokens for a user.
+
+        Args:
+            user_id: ID of the user
+
+        Returns:
+            int: Number of tokens revoked
+        """
+        try:
+            return await self.token_service.revoke_user_tokens(user_id)
+        except Exception as e:
+            logger.error(
+                "Error revoking all tokens for user %s: %s",
+                user_id,
+                str(e),
+                exc_info=True,
+            )
+            return 0

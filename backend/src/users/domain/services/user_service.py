@@ -1,22 +1,84 @@
-"""Core user service for regular user operations."""
+"""Core user service for regular user operations using Unit of Work pattern."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, ClassVar, Dict, FrozenSet
 
 from src.users.domain.entities.user import User
 from src.users.domain.exceptions import (
     InvalidCredentialsError,
+    UserNotFoundError,
     UserUpdateError,
 )
-from src.users.domain.services.base_user_service import BaseUserService
+from src.users.domain.interfaces.unit_of_work import IUnitOfWork
+from src.users.domain.interfaces.user_service import IUserService
 
 logger = logging.getLogger(__name__)
 
 
-class UserService(BaseUserService):
-    """Service for core user operations."""
+class UserService(IUserService):
+    """Service for core user operations using Unit of Work pattern."""
+
+    def __init__(
+        self,
+        uow: IUnitOfWork,
+    ) -> None:
+        """Initialize with required dependencies.
+
+        Args:
+            uow: Unit of Work instance for managing transactions and repositories
+            password_service: Service for password hashing and verification
+        """
+        self.uow = uow
+
+    # Protected fields that cannot be updated through this method
+    _PROTECTED_FIELDS: ClassVar[FrozenSet[str]] = frozenset(
+        {
+            "id",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+            "hashed_password",  # Use dedicated password update method
+        }
+    )
+
+    # Status fields that are handled specially
+    _STATUS_FIELDS: ClassVar[FrozenSet[str]] = frozenset(
+        {
+            "is_enabled_account",
+            "is_verified_email",
+        }
+    )
+
+    async def get_user_by_id(self, user_id: str) -> User:
+        """Get a user by their ID.
+
+        Args:
+            user_id: The ID of the user to retrieve
+
+        Returns:
+            User: The requested user
+
+        Raises:
+            UserNotFoundError: If the user is not found
+        """
+        return await self.uow.users.get_user_by_id(user_id)
+
+    async def get_user_by_email(self, email: str) -> User:
+        """Get a user by their email address.
+
+        Args:
+            email: The email of the user to retrieve
+
+        Returns:
+            User: The requested user
+
+        Raises:
+            UserNotFoundError: If no user exists with the given email
+        """
+        return await self.uow.users.get_user_by_email(email)
 
     async def get_my_profile(self, user_id: str) -> User:
         """Get the current user's profile.
@@ -30,7 +92,12 @@ class UserService(BaseUserService):
         Raises:
             UserNotFoundError: If the user is not found
         """
-        return await self._get_user_by_id(user_id)
+        async with self.uow.transaction():
+            user = await self.uow.users.get_user_by_id(user_id)
+            if not user or user.deleted_at is not None:
+                raise UserNotFoundError(f"User with ID {user_id} not found")
+
+            return user
 
     async def update_my_profile(
         self, user_id: str, update_data: Dict[str, Any]
@@ -48,9 +115,6 @@ class UserService(BaseUserService):
             UserNotFoundError: If the user is not found
             UserUpdateError: If the update fails
         """
-        # Get existing user
-        user = await self._get_user_by_id(user_id)
-
         # Filter allowed fields
         allowed_fields = {
             "first_name",
@@ -66,61 +130,103 @@ class UserService(BaseUserService):
         }
 
         if not update_data:
-            return user
+            # No valid fields to update, just return the current user
+            async with self.uow.transaction():
+                user = await self.uow.users.get_user_by_id(user_id)
+                if not user or user.deleted_at is not None:
+                    raise UserNotFoundError(f"User with ID {user_id} not found")
+                return user
 
-        try:
-            # Update and save user
-            updated_user = await self.user_repository.update_user_by_id(
-                user_id=user_id, update_data=update_data
-            )
-            if not updated_user:
-                raise UserUpdateError("Failed to update user profile")
+        async with self.uow.transaction():
+            try:
+                # Get existing user within transaction
+                user = await self.uow.users.get_user_by_id(user_id)
+                if not user or user.deleted_at is not None:
+                    raise UserNotFoundError(f"User with ID {user_id} not found")
 
-            return updated_user
+                # Update and save user
+                updated_user = await self.uow.users.update_user_by_id(
+                    user_id=user_id, update_data=update_data
+                )
+                if not updated_user:
+                    raise UserUpdateError("Failed to update user profile")
 
-        except Exception as e:
-            logger.error(
-                "Failed to update user profile",
-                exc_info=True,
-                extra={"user_id": user_id, "error": str(e)},
-            )
-            raise UserUpdateError("Failed to update profile") from e
+                await self.uow.commit()
+                return updated_user
 
-    async def change_password(
-        self,
-        user_id: str,
-        current_password: str,
-        new_password: str,
-    ) -> None:
-        """Change a user's password with proper validation.
+            except Exception as e:
+                await self.uow.rollback()
+                logger.error(
+                    "Failed to update user profile",
+                    exc_info=True,
+                    extra={"user_id": user_id, "error": str(e)},
+                )
+                if not isinstance(e, UserUpdateError):
+                    raise UserUpdateError("Failed to update profile") from e
+                raise
+
+    async def delete_my_profile(self, user_id: str, password: str) -> bool:
+        """Soft-delete the current user's profile after password verification.
+
+        This performs a soft delete by setting the deleted_at timestamp.
+        The user's data is preserved but marked as deleted.
 
         Args:
-            user_id: ID of the user changing their password
-            current_password: Current password for verification
-            new_password: New password to set
+            user_id: ID of the user requesting deletion
+            password: User's current password for verification
+
+        Returns:
+            bool: True if deletion was successful
 
         Raises:
-            UserNotFoundError: If user doesn't exist
-            AccountLockedError: If account is locked
-            InvalidCredentialsError: If current password is incorrect
+            UserNotFoundError: If the user is not found
+            InvalidCredentialsError: If the password is incorrect
+            UserUpdateError: If the deletion fails
         """
-        user = await self._get_user_by_id(user_id)
+        async with self.uow.transaction():
+            try:
+                # Get user and verify password within transaction
+                user = await self.uow.users.get_user_by_id(user_id)
+                if not user or user.deleted_at is not None:
+                    raise UserNotFoundError(f"User with ID {user_id} not found")
 
-        # Verify current password
-        if not user.hashed_password.verify_password_match(current_password):
-            raise InvalidCredentialsError("Current password is incorrect")
+                if not user.hashed_password.verify_password_match(password):
+                    raise InvalidCredentialsError("Incorrect password")
 
-        # Update password
-        try:
-            user.hashed_password = user.hashed_password.update_password(new_password)
-            await self.user_repository.update_user_by_id(
-                user_id, {"hashed_password": user.hashed_password}
-            )
+                # Perform soft delete by setting deleted_at timestamp
+                deleted_user = await self.uow.users.update_user_by_id(
+                    user_id=user_id,
+                    update_data={
+                        "deleted_at": datetime.now(timezone.utc),
+                        "is_enabled": False,
+                        "updated_at": datetime.now(timezone.utc),
+                    },
+                )
 
-        except Exception as e:
-            logger.error(
-                "Password change failed",
-                exc_info=True,
-                extra={"user_id": user_id, "error": str(e)},
-            )
-            raise UserUpdateError("Failed to change password") from e
+                if not deleted_user:
+                    raise UserUpdateError("Failed to delete user profile")
+
+                await self.uow.commit()
+                logger.info(
+                    "User profile soft-deleted",
+                    extra={"user_id": user_id},
+                )
+                return True
+
+            except Exception as e:
+                await self.uow.rollback()
+                logger.error(
+                    "Failed to delete user profile",
+                    exc_info=True,
+                    extra={"user_id": user_id, "error": str(e)},
+                )
+                if not isinstance(
+                    e,
+                    (
+                        UserNotFoundError,
+                        InvalidCredentialsError,
+                        UserUpdateError,
+                    ),
+                ):
+                    raise UserUpdateError("Failed to delete profile") from e
+                raise
